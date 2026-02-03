@@ -1,0 +1,195 @@
+{
+  "name": "Hotel Dienstplan-Bot",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "dienstplan",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "a1b2c3d4-1111-4000-a000-000000000001",
+      "name": "Webhook Dienstplan",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [200, 300],
+      "webhookId": "dienstplan-webhook"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ============================================\n// EINGABE VERARBEITEN & STANDARDWERTE SETZEN\n// ============================================\n\nconst body = $input.first().json.body || $input.first().json;\n\n// --- Mitarbeiter-Liste ---\n// Erwartet: Array von { name, max_stunden, position }\n// Falls nicht angegeben, werden Beispiel-Mitarbeiter verwendet\nconst mitarbeiter = body.mitarbeiter || [\n  { name: \"Anna Mueller\", max_stunden: 40, position: \"Rezeption\" },\n  { name: \"Ben Schmidt\", max_stunden: 40, position: \"Rezeption\" },\n  { name: \"Clara Weber\", max_stunden: 30, position: \"Housekeeping\" },\n  { name: \"David Fischer\", max_stunden: 40, position: \"Housekeeping\" },\n  { name: \"Eva Richter\", max_stunden: 20, position: \"Restaurant\" },\n  { name: \"Felix Koenig\", max_stunden: 40, position: \"Restaurant\" },\n  { name: \"Greta Hoffmann\", max_stunden: 40, position: \"Kueche\" },\n  { name: \"Hans Becker\", max_stunden: 35, position: \"Kueche\" }\n];\n\n// --- Wochenstart berechnen (naechster Montag falls nicht angegeben) ---\nlet wocheStart = body.woche_start;\nif (!wocheStart) {\n  const heute = new Date();\n  const wochentag = heute.getDay();\n  const diff = wochentag === 0 ? 1 : wochentag === 1 ? 0 : 8 - wochentag;\n  const montag = new Date(heute);\n  montag.setDate(heute.getDate() + diff);\n  wocheStart = montag.toISOString().split(\"T\")[0];\n}\n\n// --- Hotel-Auslastung pro Tag (0.0 - 1.0) ---\nconst auslastung = body.auslastung || {\n  Montag: 0.50,\n  Dienstag: 0.55,\n  Mittwoch: 0.60,\n  Donnerstag: 0.65,\n  Freitag: 0.85,\n  Samstag: 0.95,\n  Sonntag: 0.75\n};\n\n// --- Events ---\n// Format: [{ tag: \"Samstag\", name: \"Hochzeit\", gaeste: 120, zusatz_personal: 3 }]\nconst events = body.events || [];\n\n// --- Schicht-Definitionen ---\nconst schichten = {\n  frueh: { name: \"Fruehschicht\", start: \"06:00\", ende: \"14:00\", stunden: 8 },\n  spaet: { name: \"Spaetschicht\", start: \"14:00\", ende: \"22:00\", stunden: 8 },\n  nacht: { name: \"Nachtschicht\", start: \"22:00\", ende: \"06:00\", stunden: 8 }\n};\n\nreturn [{\n  json: {\n    mitarbeiter,\n    woche_start: wocheStart,\n    auslastung,\n    events,\n    schichten\n  }\n}];"
+      },
+      "id": "a1b2c3d4-1111-4000-a000-000000000002",
+      "name": "Eingabe verarbeiten",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ============================================\n// DIENSTPLAN GENERIEREN\n// Berechnet Personalbedarf und erstellt Plan\n// ============================================\n\nconst data = $input.first().json;\nconst { mitarbeiter, woche_start, auslastung, events, schichten } = data;\n\nconst wochentage = [\"Montag\", \"Dienstag\", \"Mittwoch\", \"Donnerstag\", \"Freitag\", \"Samstag\", \"Sonntag\"];\nconst totalMA = mitarbeiter.length;\n\n// ---- SCHRITT 1: Personalbedarf pro Tag berechnen ----\nconst bedarf = {};\n\nfor (const tag of wochentage) {\n  const tagesAuslastung = auslastung[tag] !== undefined ? auslastung[tag] : 0.5;\n  const tagesEvents = events.filter(e => e.tag === tag);\n  const eventBonus = tagesEvents.reduce((sum, e) => sum + (e.zusatz_personal || 0), 0);\n\n  // Basisbedarf skaliert mit Auslastung\n  // Fruehschicht: 40% der Kapazitaet (Checkout, Reinigung, Fruehstueck)\n  // Spaetschicht: 35% der Kapazitaet (Check-in, Abendservice)\n  // Nachtschicht: 15% der Kapazitaet (Rezeption, Sicherheit)\n  const basisFrueh = Math.max(2, Math.ceil(totalMA * tagesAuslastung * 0.40));\n  const basisSpaet = Math.max(2, Math.ceil(totalMA * tagesAuslastung * 0.35));\n  const basisNacht = Math.max(1, Math.ceil(totalMA * tagesAuslastung * 0.15));\n\n  bedarf[tag] = {\n    auslastung_prozent: Math.round(tagesAuslastung * 100),\n    events: tagesEvents,\n    frueh: Math.min(basisFrueh + Math.ceil(eventBonus * 0.4), totalMA),\n    spaet: Math.min(basisSpaet + Math.ceil(eventBonus * 0.4), totalMA),\n    nacht: Math.min(basisNacht + Math.ceil(eventBonus * 0.2), totalMA)\n  };\n}\n\n// ---- SCHRITT 2: Mitarbeiter-Status initialisieren ----\nconst maStatus = mitarbeiter.map((m, i) => ({\n  index: i,\n  name: m.name,\n  position: m.position || \"Allgemein\",\n  max_stunden: m.max_stunden || 40,\n  stunden: 0,\n  letzte_schicht: null,\n  freie_tage: 0,\n  arbeitstage: 0,\n  counts: { frueh: 0, spaet: 0, nacht: 0 }\n}));\n\n// ---- SCHRITT 3: Schichten zuweisen ----\nconst dienstplan = {};\n\nfor (const tag of wochentage) {\n  dienstplan[tag] = { frueh: [], spaet: [], nacht: [], frei: [] };\n  const zugewiesen = new Set();\n\n  for (const typ of [\"frueh\", \"spaet\", \"nacht\"]) {\n    const benoetigte = bedarf[tag][typ];\n    const stundenSchicht = schichten[typ].stunden;\n\n    // Verfuegbare Mitarbeiter ermitteln und sortieren\n    const verfuegbar = maStatus\n      .filter(s => {\n        // Bereits heute eingeteilt?\n        if (zugewiesen.has(s.index)) return false;\n        // Stundenlimit ueberschritten?\n        if (s.stunden + stundenSchicht > s.max_stunden) return false;\n        // Nach Nachtschicht keine Fruehschicht (Ruhezeit)\n        if (typ === \"frueh\" && s.letzte_schicht === \"nacht\") return false;\n        // Max 6 Arbeitstage pro Woche\n        if (s.arbeitstage >= 6) return false;\n        return true;\n      })\n      .sort((a, b) => {\n        // 1. Weniger geleistete Stunden bevorzugen\n        const stundenDiff = a.stunden - b.stunden;\n        if (stundenDiff !== 0) return stundenDiff;\n        // 2. Weniger Schichten dieses Typs (faire Rotation)\n        const countDiff = a.counts[typ] - b.counts[typ];\n        if (countDiff !== 0) return countDiff;\n        // 3. Mehr freie Tage = laenger nicht gearbeitet\n        return b.freie_tage - a.freie_tage;\n      });\n\n    const anzahl = Math.min(benoetigte, verfuegbar.length);\n    for (let i = 0; i < anzahl; i++) {\n      const ma = verfuegbar[i];\n      dienstplan[tag][typ].push({\n        name: ma.name,\n        position: ma.position,\n        von: schichten[typ].start,\n        bis: schichten[typ].ende,\n        stunden: stundenSchicht\n      });\n      zugewiesen.add(ma.index);\n      maStatus[ma.index].stunden += stundenSchicht;\n      maStatus[ma.index].letzte_schicht = typ;\n      maStatus[ma.index].counts[typ]++;\n      maStatus[ma.index].arbeitstage++;\n      maStatus[ma.index].freie_tage = 0;\n    }\n  }\n\n  // Freie Mitarbeiter markieren\n  for (const s of maStatus) {\n    if (!zugewiesen.has(s.index)) {\n      dienstplan[tag].frei.push(s.name);\n      s.letzte_schicht = null;\n      s.freie_tage++;\n    }\n  }\n}\n\n// ---- SCHRITT 4: Uebersicht erstellen ----\nconst uebersicht = maStatus.map(s => ({\n  name: s.name,\n  position: s.position,\n  stunden: s.stunden,\n  max_stunden: s.max_stunden,\n  auslastung_prozent: Math.round((s.stunden / s.max_stunden) * 100),\n  freie_tage: 7 - s.arbeitstage,\n  fruehschichten: s.counts.frueh,\n  spaetschichten: s.counts.spaet,\n  nachtschichten: s.counts.nacht\n}));\n\nreturn [{\n  json: {\n    woche_start,\n    dienstplan,\n    bedarf,\n    uebersicht\n  }\n}];"
+      },
+      "id": "a1b2c3d4-1111-4000-a000-000000000003",
+      "name": "Dienstplan generieren",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [720, 300]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ============================================\n// AUSGABE FORMATIEREN\n// Erstellt lesbare Text-Ausgabe des Dienstplans\n// ============================================\n\nconst data = $input.first().json;\nconst { woche_start, dienstplan, bedarf, uebersicht } = data;\n\nconst wochentage = [\"Montag\", \"Dienstag\", \"Mittwoch\", \"Donnerstag\", \"Freitag\", \"Samstag\", \"Sonntag\"];\nconst startDatum = new Date(woche_start + \"T00:00:00\");\n\n// --- Header ---\nlet text = \"=\".repeat(55) + \"\\n\";\ntext += \"  HOTEL DIENSTPLAN\\n\";\ntext += \"  Woche ab: \" + woche_start + \"\\n\";\ntext += \"  Erstellt: \" + new Date().toLocaleString(\"de-DE\") + \"\\n\";\ntext += \"=\".repeat(55) + \"\\n\\n\";\n\n// --- Tagesplaene ---\nfor (let i = 0; i < wochentage.length; i++) {\n  const tag = wochentage[i];\n  const datum = new Date(startDatum);\n  datum.setDate(startDatum.getDate() + i);\n  const dd = String(datum.getDate()).padStart(2, \"0\");\n  const mm = String(datum.getMonth() + 1).padStart(2, \"0\");\n  const yyyy = datum.getFullYear();\n\n  const b = bedarf[tag];\n  text += \"-\".repeat(55) + \"\\n\";\n  text += \"  \" + tag.toUpperCase() + \", \" + dd + \".\" + mm + \".\" + yyyy;\n  text += \" | Auslastung: \" + b.auslastung_prozent + \"%\";\n  if (b.events && b.events.length > 0) {\n    text += \"\\n  Events: \" + b.events.map(e => e.name + \" (\" + (e.gaeste || \"?\") + \" Gaeste)\").join(\", \");\n  }\n  text += \"\\n\".repeat(2);\n\n  const plan = dienstplan[tag];\n\n  text += \"  [F] Fruehschicht  (06:00-14:00) | Bedarf: \" + b.frueh + \"\\n\";\n  if (plan.frueh.length > 0) {\n    for (const m of plan.frueh) {\n      text += \"      - \" + m.name + \" (\" + m.position + \")\\n\";\n    }\n  } else {\n    text += \"      (keine Zuweisung)\\n\";\n  }\n\n  text += \"  [S] Spaetschicht  (14:00-22:00) | Bedarf: \" + b.spaet + \"\\n\";\n  if (plan.spaet.length > 0) {\n    for (const m of plan.spaet) {\n      text += \"      - \" + m.name + \" (\" + m.position + \")\\n\";\n    }\n  } else {\n    text += \"      (keine Zuweisung)\\n\";\n  }\n\n  text += \"  [N] Nachtschicht  (22:00-06:00) | Bedarf: \" + b.nacht + \"\\n\";\n  if (plan.nacht.length > 0) {\n    for (const m of plan.nacht) {\n      text += \"      - \" + m.name + \" (\" + m.position + \")\\n\";\n    }\n  } else {\n    text += \"      (keine Zuweisung)\\n\";\n  }\n\n  if (plan.frei.length > 0) {\n    text += \"  [X] Frei: \" + plan.frei.join(\", \") + \"\\n\";\n  }\n  text += \"\\n\";\n}\n\n// --- Mitarbeiter-Uebersicht ---\ntext += \"=\".repeat(55) + \"\\n\";\ntext += \"  MITARBEITER-UEBERSICHT\\n\";\ntext += \"=\".repeat(55) + \"\\n\\n\";\n\nfor (const ma of uebersicht) {\n  text += \"  \" + ma.name + \" (\" + ma.position + \")\\n\";\n  text += \"    Stunden: \" + ma.stunden + \"/\" + ma.max_stunden + \"h\";\n  text += \" (\" + ma.auslastung_prozent + \"% Auslastung)\";\n  text += \" | Freie Tage: \" + ma.freie_tage + \"\\n\";\n  text += \"    Schichten: F:\" + ma.fruehschichten;\n  text += \" S:\" + ma.spaetschichten;\n  text += \" N:\" + ma.nachtschichten + \"\\n\\n\";\n}\n\ntext += \"=\".repeat(55) + \"\\n\";\n\nreturn [{\n  json: {\n    woche_start,\n    dienstplan,\n    uebersicht,\n    dienstplan_text: text\n  }\n}];"
+      },
+      "id": "a1b2c3d4-1111-4000-a000-000000000004",
+      "name": "Ausgabe formatieren",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [980, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($input.first().json, null, 2) }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "application/json; charset=utf-8"
+              }
+            ]
+          }
+        }
+      },
+      "id": "a1b2c3d4-1111-4000-a000-000000000005",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1240, 300]
+    },
+    {
+      "parameters": {
+        "content": "## Hotel Dienstplan-Bot\n\n### Webhook-Endpunkt\n`POST /webhook/dienstplan`\n\n### Eingabe-Parameter (JSON Body)\n```json\n{\n  \"mitarbeiter\": [\n    { \"name\": \"Max Mustermann\", \"max_stunden\": 40, \"position\": \"Rezeption\" }\n  ],\n  \"woche_start\": \"2026-02-09\",\n  \"auslastung\": {\n    \"Montag\": 0.50,\n    \"Dienstag\": 0.55,\n    \"Mittwoch\": 0.60,\n    \"Donnerstag\": 0.65,\n    \"Freitag\": 0.85,\n    \"Samstag\": 0.95,\n    \"Sonntag\": 0.75\n  },\n  \"events\": [\n    {\n      \"tag\": \"Samstag\",\n      \"name\": \"Hochzeitsfeier\",\n      \"gaeste\": 120,\n      \"zusatz_personal\": 3\n    }\n  ]\n}\n```\n\n### Alle Parameter sind optional!\nOhne Eingabe werden Standardwerte verwendet.\n\n### Algorithmus\n- Personalbedarf wird aus Auslastung + Events berechnet\n- Faire Verteilung: wenigste Stunden zuerst\n- Nachtschicht-Regel: nach Nacht keine Fruehschicht\n- Max 6 Arbeitstage pro Woche\n- Schichttyp-Rotation fuer Fairness",
+        "height": 620,
+        "width": 380,
+        "color": 4
+      },
+      "id": "a1b2c3d4-1111-4000-a000-000000000006",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-180, 120]
+    },
+    {
+      "parameters": {},
+      "id": "a1b2c3d4-1111-4000-a000-000000000007",
+      "name": "Manueller Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [200, 520]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ============================================\n// TESTDATEN FUER MANUELLEN TRIGGER\n// ============================================\n\nreturn [{\n  json: {\n    body: {\n      mitarbeiter: [\n        { name: \"Anna Mueller\", max_stunden: 40, position: \"Rezeption\" },\n        { name: \"Ben Schmidt\", max_stunden: 40, position: \"Rezeption\" },\n        { name: \"Clara Weber\", max_stunden: 30, position: \"Housekeeping\" },\n        { name: \"David Fischer\", max_stunden: 40, position: \"Housekeeping\" },\n        { name: \"Eva Richter\", max_stunden: 20, position: \"Restaurant\" },\n        { name: \"Felix Koenig\", max_stunden: 40, position: \"Restaurant\" },\n        { name: \"Greta Hoffmann\", max_stunden: 40, position: \"Kueche\" },\n        { name: \"Hans Becker\", max_stunden: 35, position: \"Kueche\" }\n      ],\n      woche_start: \"2026-02-09\",\n      auslastung: {\n        Montag: 0.50,\n        Dienstag: 0.55,\n        Mittwoch: 0.60,\n        Donnerstag: 0.65,\n        Freitag: 0.85,\n        Samstag: 0.95,\n        Sonntag: 0.75\n      },\n      events: [\n        {\n          tag: \"Samstag\",\n          name: \"Hochzeitsfeier\",\n          gaeste: 120,\n          zusatz_personal: 3\n        },\n        {\n          tag: \"Freitag\",\n          name: \"Firmenkonferenz\",\n          gaeste: 80,\n          zusatz_personal: 2\n        }\n      ]\n    }\n  }\n}];"
+      },
+      "id": "a1b2c3d4-1111-4000-a000-000000000008",
+      "name": "Testdaten setzen",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 520]
+    }
+  ],
+  "connections": {
+    "Webhook Dienstplan": {
+      "main": [
+        [
+          {
+            "node": "Eingabe verarbeiten",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Eingabe verarbeiten": {
+      "main": [
+        [
+          {
+            "node": "Dienstplan generieren",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dienstplan generieren": {
+      "main": [
+        [
+          {
+            "node": "Ausgabe formatieren",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ausgabe formatieren": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manueller Trigger": {
+      "main": [
+        [
+          {
+            "node": "Testdaten setzen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Testdaten setzen": {
+      "main": [
+        [
+          {
+            "node": "Eingabe verarbeiten",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "1",
+  "meta": {
+    "instanceId": "hotel-dienstplan-bot-v1"
+  },
+  "tags": [
+    {
+      "name": "hotel",
+      "id": "1"
+    },
+    {
+      "name": "dienstplan",
+      "id": "2"
+    },
+    {
+      "name": "scheduling",
+      "id": "3"
+    }
+  ]
+}
